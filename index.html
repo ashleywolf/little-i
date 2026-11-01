@@ -1,0 +1,1057 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>little i: a one-key game about SHIFT</title>
+<meta name="description" content="A one-key game for GitHub Game Off 2026. The whole world is built from the letters S, H, I, F, T, and Shift changes everything.">
+<style>
+  html, body { margin: 0; height: 100%; background: #f4ebdf; overflow: hidden; touch-action: none; -webkit-user-select: none; user-select: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; border-radius: 14px; box-shadow: 0 10px 40px rgba(120, 90, 140, .18); outline: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540" tabindex="0" aria-label="little i, a one-key game. Use only the Shift key."></canvas>
+<script>
+(() => {
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+const W = 960, H = 540, U = 36, ROWS = 15;
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+let pxScale = 1;
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H) * 0.98;
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.width = Math.round(W * s) + 'px';
+  cv.style.height = Math.round(H * s) + 'px';
+  cv.width = Math.round(W * s * dpr);
+  cv.height = Math.round(H * s * dpr);
+  pxScale = s * dpr;
+}
+addEventListener('resize', resize);
+resize();
+
+const FONT = '"ui-rounded","SF Pro Rounded","Arial Rounded MT Bold","Nunito","Varela Round","Trebuchet MS",system-ui,sans-serif';
+const font = (px, w = 700) => `${w} ${px}px ${FONT}`;
+
+const COL = {
+  paper: '#fffaf1', rule: '#e3ecf6', margin: '#f7c6cf', ink: '#6a587c',
+  ground: '#f1e3d1', keyTray: '#eadbc8', keySide: '#d8c5ae', keyFace: '#fbf4ea',
+  s: ['#7fd1ae', '#4ea882'], h: ['#f7a98b', '#d27a5b'], i: ['#a98be0', '#7a5db8'],
+  f: ['#f590b9', '#cd6391'], t: ['#f2c94c', '#c89b1f'], leaf: ['#a6dea0', '#6bb366'],
+};
+const LETTER_COLS = { s: COL.s, h: COL.h, i: COL.i, f: COL.f, t: COL.t };
+
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const approach = (v, t, d) => (v < t ? Math.min(t, v + d) : Math.max(t, v - d));
+const easeBack = (t) => { const c1 = 1.9, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const now = () => performance.now() / 1000;
+
+// ---------------------------------------------------------------------------
+// Physics tuning (units are grid cells and seconds)
+// ---------------------------------------------------------------------------
+const RUN = 4, G = 40, MAXFALL = 22, HOP = -9.5, SPRING = -19, SLIDE_VX = 12, SLIDE_VY = -12, CLIMB = 5, RETRY_BACK = 1.4;
+const TAP_HOP = -9, BIG_BOING = -14, DOUBLE_T = 0.35, SLIDE_HOLD = 0.15;
+const SMALL = { w: 0.42, h: 1.0 }, BIG = { w: 1.3, h: 2.2 };
+const GRAB = 3.0, ROPE_MIN = 1.6, ROPE_MAX = 2.3, SWING_AMP = 1.15, RELEASE_BOOST = 1.3;
+const HOLD = 0.6; // seconds to hold Shift to pick a menu option
+
+// ---------------------------------------------------------------------------
+// Sound: procedural Web Audio, no files
+// ---------------------------------------------------------------------------
+const snd = { ac: null, master: null, on: true, muted: false, noise: null };
+function audioInit() {
+  try {
+    if (!snd.ac) {
+      const A = window.AudioContext || window.webkitAudioContext;
+      if (!A) return;
+      snd.ac = new A();
+      snd.master = snd.ac.createGain();
+      snd.master.gain.value = 0.6;
+      snd.master.connect(snd.ac.destination);
+      const len = snd.ac.sampleRate * 0.5, b = snd.ac.createBuffer(1, len, snd.ac.sampleRate), d = b.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      snd.noise = b;
+    }
+    if (snd.ac.state === 'suspended') snd.ac.resume();
+  } catch (e) { /* audio is optional */ }
+}
+const canPlay = () => snd.ac && snd.on && !snd.muted && snd.ac.state === 'running';
+function env(g, t, a, peak, decay) {
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + a);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + a + decay);
+}
+function tone(type, f0, f1, dur, vol, when = 0) {
+  if (!canPlay()) return;
+  const ac = snd.ac, t = ac.currentTime + when;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  env(g, t, 0.005, vol, dur);
+  o.connect(g); g.connect(snd.master);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+function hiss(dur, vol, freq, q = 1, type = 'bandpass', when = 0, f1) {
+  if (!canPlay()) return;
+  const ac = snd.ac, t = ac.currentTime + when;
+  const s = ac.createBufferSource(); s.buffer = snd.noise;
+  const f = ac.createBiquadFilter(); f.type = type; f.frequency.setValueAtTime(freq, t);
+  if (f1) f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  f.Q.value = q;
+  const g = ac.createGain(); env(g, t, 0.002, vol, dur);
+  s.connect(f); f.connect(g); g.connect(snd.master);
+  s.start(t); s.stop(t + dur + 0.05);
+}
+const sfx = {
+  clack(down) {
+    hiss(0.04, down ? 0.3 : 0.18, down ? 2000 : 2800, 1.2);
+    tone('sine', down ? 190 : 260, down ? 110 : 150, 0.06, down ? 0.08 : 0.05);
+  },
+  boing() {
+    if (!canPlay()) return;
+    const ac = snd.ac, t = ac.currentTime;
+    const o = ac.createOscillator(), g = ac.createGain(), lfo = ac.createOscillator(), lg = ac.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(160, t);
+    o.frequency.exponentialRampToValueAtTime(520, t + 0.12);
+    o.frequency.exponentialRampToValueAtTime(240, t + 0.45);
+    lfo.frequency.value = 22; lg.gain.value = 40;
+    lfo.connect(lg); lg.connect(o.frequency);
+    env(g, t, 0.01, 0.32, 0.5);
+    o.connect(g); g.connect(snd.master);
+    o.start(t); lfo.start(t); o.stop(t + 0.6); lfo.stop(t + 0.6);
+  },
+  hop() { tone('sine', 420, 760, 0.12, 0.16); },
+  bigBoing() { sfx.boing(); tone('sine', 260, 1100, 0.3, 0.18); },
+  spring() { tone('sine', 300, 1200, 0.25, 0.24); tone('triangle', 600, 1500, 0.2, 0.07, 0.03); },
+  whoosh() { hiss(0.45, 0.35, 500, 0.8, 'bandpass', 0, 3000); tone('sine', 300, 700, 0.3, 0.07); },
+  grab() { tone('triangle', 660, 880, 0.08, 0.12); },
+  letgo() { tone('triangle', 880, 1320, 0.1, 0.12); },
+  ding() { tone('sine', 2093, null, 1.2, 0.2); tone('sine', 2793, null, 0.8, 0.07); tone('sine', 1046, null, 0.6, 0.05); },
+  tick() { tone('square', 1200, 900, 0.03, 0.05); },
+  win() { [0, 4, 7, 12].forEach((n, i) => tone('triangle', 523.25 * Math.pow(2, n / 12), null, 0.35, 0.15, i * 0.09)); sfx.ding(); },
+};
+
+// A cozy loop. Holding Shift shifts the key of the music up a fourth.
+const music = { next: 0, step: 0 };
+const MEL = [0, -1, 4, 7, 9, -1, 7, 4, 2, -1, 4, -1, 0, -1, -1, -1, 0, -1, 4, 7, 9, 12, 9, 7, 4, -1, 2, 4, 0, -1, -1, -1];
+const BASS = [0, -3, -7, -5];
+function musicTick(upper) {
+  if (!canPlay()) { if (snd.ac) music.next = snd.ac.currentTime; return; }
+  const ac = snd.ac, step = 60 / 84 / 2;
+  if (music.next < ac.currentTime) music.next = ac.currentTime + 0.05;
+  while (music.next < ac.currentTime + 0.15) {
+    const tr = upper ? 5 : 0, t = music.next - ac.currentTime, i = music.step % MEL.length;
+    if (MEL[i] >= 0) tone('sine', 523.25 * Math.pow(2, (MEL[i] + tr) / 12), null, 0.6, 0.03, t);
+    if (i % 8 === 0) tone('sine', 130.81 * Math.pow(2, (BASS[(i / 8) | 0] + tr) / 12), null, 1.6, 0.05, t);
+    music.next += step; music.step++;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Levels: built with a tiny builder so they're easy to author and tweak
+// ---------------------------------------------------------------------------
+function makeLevel(name, tag, fn) {
+  const L = { name, tag, grid: [], els: [], signs: [], zones: [], c: 0, gy: 12, start: { x: 2.5, y: 12 }, goalX: 0, w: 0 };
+  const fill = (c, r0, r1) => {
+    if (!L.grid[c]) L.grid[c] = new Uint8Array(ROWS);
+    for (let r = Math.max(0, r0); r < Math.min(ROWS, r1); r++) L.grid[c][r] = 1;
+  };
+  const b = {
+    g(n) { for (let i = 0; i < n; i++) fill(L.c + i, L.gy, ROWS); L.c += n; return b; },
+    gap(n) { L.c += n; return b; },
+    to(y) { L.gy = y; return b; },
+    tunnel(n) { for (let i = 0; i < n; i++) fill(L.c + i, L.gy - 4, L.gy - 2); return b.g(n); },
+    step() { L.els.push({ t: 'h', c: L.c, b: L.gy, k: 0 }); return b.g(1); },
+    ladder() { L.els.push({ t: 'h', c: L.c, b: L.gy, k: 0 }); L.zones.push([L.c - 1.2, L.c + 1.2]); return b.g(1); },
+    bridge() { L.els.push({ t: 't', c: L.c + 1, b: L.gy + 3, k: 0 }); L.zones.push([L.c - 0.6, L.c + 3.4]); L.c += 3; return b; },
+    sprout() { L.els.push({ t: 't', c: L.c, b: L.gy, k: 0, deco: true }); return b; },
+    crack() { L.zones.push([L.c - 0.9, L.c + 1.9]); L.c += 1; return b; },
+    spring() { L.els.push({ t: 's', c: L.c, b: L.gy, k: 0, sq: 0 }); return b.g(1); },
+    slide() { L.els.push({ t: 's', c: L.c, b: L.gy, k: 0, sq: 0 }); L.zones.push([L.c - 0.8, L.c + 1.5]); return b.g(1); },
+    flag() { L.els.push({ t: 'f', c: L.c, b: L.gy, k: 0, on: false, wave: 0 }); L.zones.push([L.c - 0.2, L.c + 1.2]); return b.g(1); },
+    hook(dc = 0) { L.els.push({ t: 'hook', c: L.c + dc, r: L.gy - 3, k: 0, cool: 0 }); return b; },
+    sign(text, dc = 0, y) { L.signs.push({ x: L.c + dc, y: y == null ? L.gy - 3.4 : y, text }); return b; },
+    goal() { L.goalX = L.c + 2.5; L.els.push({ t: 'goal', c: L.c + 2, b: L.gy, k: 0 }); return b.g(16); },
+  };
+  fn(b);
+  L.w = L.c;
+  L.steps = L.els.filter((e) => e.t === 'h');
+  L.trees = L.els.filter((e) => e.t === 't' && !e.deco);
+  L.springs = L.els.filter((e) => e.t === 's');
+  L.flags = L.els.filter((e) => e.t === 'f');
+  L.hooks = L.els.filter((e) => e.t === 'hook');
+  return L;
+}
+
+const LEVELS = [
+  () => makeLevel('lowercase world', 'hold Shift and the world goes UPPERCASE', (b) => b
+    .g(3).sign('little i runs all by itself.\ntap shift to boing!', 0).g(9)
+    .sign('tap shift twice, fast,\nfor a BIG boing!', 0).g(9)
+    .sign('little h is a step.\nlittle i hops right up', -1).g(3).step().g(7)
+    .sign('a wall! hold shift and\nh grows into a ladder H', -2).g(3).ladder().to(9).g(7).to(12).g(3)
+    .sign('hold shift as you pass\nlittle f to plant a flag F', -1).g(3).flag().g(6)
+    .sign('hold shift and t grows\ninto a T bridge', -1).g(3).bridge().g(5).bridge().g(1).bridge().g(5)
+    .flag().g(5)
+    .sign('big I is too wide\nto fall in cracks', -1).g(3).crack().g(2).crack().g(1).crack().g(5)
+    .sign('let go! only little i\nfits under low roofs', -1).g(3).sprout().tunnel(9).g(4)
+    .flag().g(5)
+    .sign('you did it! one more\nladder, one more bridge', -1).g(3).ladder().to(9).g(4).to(12).g(2).bridge().g(4)
+    .goal()),
+
+  () => makeLevel('springs & slides', 'little s goes up. big S goes across.', (b) => b
+    .g(4).sign('little s is a spring.\nlittle i boings way up!', 0).g(5).spring().g(1).to(8).g(8).to(12).g(4)
+    .sign('big S is a slide.\nhold shift to zoom!', -1).g(3).slide().gap(5).g(5)
+    .flag().g(5)
+    .sign('springs go up,\nslides go across', -1).g(3).spring().g(1).to(8).g(5).to(12).g(5).slide().gap(5).g(5)
+    .flag().g(4)
+    .sign('mix it up!', 0).g(3).bridge().g(4).spring().g(1).to(8).g(5).crack().g(4).to(12).g(4)
+    .flag().g(5)
+    .slide().gap(5).g(6).tunnel(6).g(3).ladder().to(9).g(5).to(12).g(3).spring().g(1).to(8).g(5).to(12).g(3)
+    .goal()),
+
+  () => makeLevel('hooks & flags', 'little f is a hook. tap Shift to let go.', (b) => b
+    .g(4).sign('little f is a hook.\nlittle i grabs on!', 0).g(6)
+    .hook().gap(3).g(5)
+    .sign('tap shift to let go.\nlet go on the upswing!', -1).g(4)
+    .hook().gap(4).g(5)
+    .flag().g(5)
+    .sign('one more time!', -1).g(4).hook().gap(4).g(5)
+    .flag().g(4)
+    .sign('hook to hook:\ntap, then tap again', -1).g(4).hook().gap(4).hook().gap(4).g(5)
+    .flag().g(5)
+    .sign('hooks and ladders', -1).g(3).ladder().to(9).g(5).hook().gap(4).g(5).to(12).g(3)
+    .bridge().g(4)
+    .goal()),
+
+  () => makeLevel('SHIFT happens', 'everything, all at once!', (b) => b
+    .g(4).sign('the big finale.\nyou know every letter now', 0).g(6)
+    .step().g(4).ladder().to(9).g(3).crack().g(3).to(12).g(3).bridge().g(4)
+    .flag().g(4)
+    .spring().g(1).to(8).g(4).to(12).g(6).slide().gap(5).g(5).sprout().tunnel(7).g(3)
+    .flag().g(4)
+    .hook().gap(4).g(4).bridge().g(1).bridge().g(4).crack().g(1).crack().g(4)
+    .flag().g(4)
+    .spring().g(1).to(8).g(5).to(12).g(5).hook().gap(4).hook().gap(4).g(5)
+    .flag().g(4)
+    .ladder().to(9).g(3).to(12).g(3).slide().gap(5).g(6).step().g(5)
+    .goal()),
+];
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const save = (() => { try { return JSON.parse(localStorage.getItem('little-i') || '{}'); } catch (e) { return {}; } })();
+save.done = save.done || [];
+const persist = () => { try { localStorage.setItem('little-i', JSON.stringify(save)); } catch (e) { /* private mode */ } };
+if (save.sound === false) snd.on = false;
+
+const game = { state: 'title', menu: null, idx: 0, boings: 0, time: 0, worldK: 0, sim: null, cardT: 0, bothT: 0, banner: 0, clock: 0, flags: 0, trail: [] };
+let level = LEVELS[0]();
+let p = null;
+const cam = { x: 0 };
+const particles = [];
+const bgLetters = [];
+for (let i = 0; i < 16; i++) {
+  bgLetters.push({ x: i * 13.1 + ((i * 37) % 11), y: 1 + ((i * 53) % 7), ch: 'shift'[i % 5], size: 2 + ((i * 17) % 3), rot: ((i * 29) % 20 - 10) / 40 });
+}
+
+const input = { L: false, R: false, P: false, down: false, pressAt: 0, latch: false };
+const shiftHeld = () => (game.sim ? game.sim.shift : input.down && !input.latch);
+
+// ---------------------------------------------------------------------------
+// Collision helpers
+// ---------------------------------------------------------------------------
+function isSolid(c, r) {
+  if (r < 0 || r >= ROWS) return false;
+  if (c < 0) return true;
+  const col = level.grid[c];
+  return !!(col && col[r]);
+}
+const stepBox = (e) => ({ x0: e.c + 0.12, y0: e.b - 0.7, x1: e.c + 0.88, y1: e.b, kind: 'h' });
+function solidsIn(x0, y0, x1, y1, upper) {
+  const out = [];
+  const c0 = Math.floor(x0), c1 = Math.floor(x1 - 1e-6), r0 = Math.floor(y0), r1 = Math.floor(y1 - 1e-6);
+  for (let c = c0; c <= c1; c++) for (let r = r0; r <= r1; r++) if (isSolid(c, r)) out.push({ x0: c, y0: r, x1: c + 1, y1: r + 1, kind: 'g' });
+  if (!upper) for (const e of level.steps) { const s = stepBox(e); if (x1 > s.x0 && x0 < s.x1 && y1 > s.y0 && y0 < s.y1) out.push(s); }
+  return out;
+}
+function platforms(upper) {
+  if (!upper) return [];
+  const out = [];
+  for (const e of level.steps) out.push({ x0: e.c, x1: e.c + 1, y: e.b - 3 });
+  for (const e of level.trees) out.push({ x0: e.c - 1, x1: e.c + 2, y: e.b - 3 });
+  return out;
+}
+function moveX(dx, upper) {
+  if (!dx) return null;
+  const nx = p.x + dx, hw = p.w / 2;
+  const hits = solidsIn(nx - hw, p.y - p.h + 0.002, nx + hw, p.y - 0.002, upper);
+  if (!hits.length) { p.x = nx; return null; }
+  let blk = hits[0];
+  if (dx > 0) { for (const h of hits) if (h.x0 < blk.x0) blk = h; p.x = Math.min(nx, blk.x0 - hw - 1e-4); }
+  else { for (const h of hits) if (h.x1 > blk.x1) blk = h; p.x = Math.max(nx, blk.x1 + hw + 1e-4); }
+  return blk;
+}
+function moveY(dy, upper) {
+  p.grounded = false;
+  const ny = p.y + dy, hw = p.w / 2;
+  const hits = solidsIn(p.x - hw + 0.002, ny - p.h, p.x + hw - 0.002, ny, upper);
+  if (dy > 0) {
+    let top = Infinity;
+    for (const h of hits) top = Math.min(top, h.y0);
+    for (const pl of platforms(upper)) if (p.x + hw > pl.x0 && p.x - hw < pl.x1 && p.y <= pl.y + 0.01 && ny >= pl.y) top = Math.min(top, pl.y);
+    if (top < Infinity) { p.y = Math.min(ny, top); p.vy = 0; p.grounded = true; return; }
+  } else if (dy < 0 && hits.length) {
+    let bot = -Infinity;
+    for (const h of hits) bot = Math.max(bot, h.y1);
+    p.y = bot + p.h + 1e-4; p.vy = 0; return;
+  }
+  p.y = ny;
+}
+function setForm(big, upper) {
+  const S = big ? BIG : SMALL;
+  if (!big) { if (p.w !== S.w) { p.w = S.w; p.h = S.h; p.morph = 1; } p.squished = false; return; }
+  if (p.w === S.w) return;
+  for (const off of [0, -0.3, 0.3, -0.45, 0.45]) {
+    if (!solidsIn(p.x + off - S.w / 2, p.y - S.h + 0.002, p.x + off + S.w / 2, p.y - 0.002, upper).length) {
+      p.x += off; p.w = S.w; p.h = S.h; p.morph = 1; p.squished = false; return;
+    }
+  }
+  p.squished = true;
+}
+const overlapsP = (x0, y0, x1, y1) => p.x + p.w / 2 > x0 && p.x - p.w / 2 < x1 && p.y > y0 && p.y - p.h < y1;
+
+// ---------------------------------------------------------------------------
+// Player
+// ---------------------------------------------------------------------------
+function resetPlayer(cp, readyT) {
+  p = { x: cp.x, y: cp.y, vx: 0, vy: 0, w: SMALL.w, h: SMALL.h, grounded: false, state: 'ready', readyT,
+    bonkT: 0, boost: false, hook: null, th: 0, dir: 1, L: 2.5, squished: false, morph: 1, phase: 0, deadT: 0, cp, ladder: null, winT: 0,
+    prevUp: shiftHeld(), upT: 0, airJump: true, lastPress: -9 };
+}
+function bonk() {
+  p.state = 'bonk'; p.bonkT = 0.32; p.vx = -3.2; p.vy = -6; p.grounded = false;
+  sfx.boing(); burst(p.x + p.w / 2, p.y - p.h * 0.7, 5, COL.i[0]);
+}
+function die() {
+  if (p.state === 'dead') return;
+  p.state = 'dead'; p.deadT = 0.55; game.boings++;
+  // Relaxing retries: pop back to where little i stood about a second ago.
+  const tr = game.trail;
+  let i = tr.length - 1;
+  while (i > 0 && tr[i].t > game.time - RETRY_BACK) i--;
+  if (i >= 0) { p.cp = { x: tr[i].x, y: tr[i].y }; tr.length = i + 1; }
+  sfx.boing();
+}
+function respawn() {
+  resetPlayer(p.cp, 0.6);
+  p.y = p.cp.y; p.vy = -7;
+  burst(p.x, p.y - 0.5, 8, COL.i[0]);
+}
+// Remember safe spots: solid keycaps under both feet, so retries never start at an edge.
+function rememberSafeSpot() {
+  const tr = game.trail, r = Math.floor(p.y + 0.01);
+  if (!p.grounded || p.state !== 'run' || Math.abs(p.y - Math.round(p.y)) > 0.01) return;
+  if (!isSolid(Math.floor(p.x - 0.7), r) || !isSolid(Math.floor(p.x + 0.7), r)) return;
+  if (tr.length && game.time - tr[tr.length - 1].t < 0.2) return;
+  tr.push({ x: p.x, y: p.y, t: game.time });
+  if (tr.length > 30) tr.shift();
+}
+function win() {
+  p.state = 'win'; p.winT = 0;
+  sfx.win();
+  if (game.sim) return;
+  save.done[game.idx] = true;
+  const best = save.best || (save.best = {});
+  if (best[game.idx] == null || game.boings < best[game.idx]) best[game.idx] = game.boings;
+  persist();
+  for (let i = 0; i < 30; i++) burst(p.x, p.y - 1, 1, LETTER_COLS['shift'[i % 5]][0]);
+}
+
+function updatePlayer(dt, up) {
+  p.morph = Math.max(0, p.morph - dt * 5);
+  p.phase += dt * (p.grounded ? 14 : 4);
+
+  if (p.state === 'dead') { p.deadT -= dt; if (p.deadT <= 0) respawn(); return; }
+  if (p.state === 'win') {
+    p.winT += dt;
+    p.vx = approach(p.vx, 0, dt * 12);
+    p.vy = Math.min(p.vy + G * dt, MAXFALL);
+    moveX(p.vx * dt, up); moveY(p.vy * dt, up);
+    if (p.grounded && p.winT > 0.3) p.vy = -8;
+    return;
+  }
+
+  const wantBig = up && p.state !== 'swing';
+  if (wantBig !== (p.w === BIG.w)) setForm(wantBig, up);
+
+  // A fresh Shift press is a "boing": tap for a hop, tap twice fast for a BIG boing.
+  const pressed = up && !p.prevUp;
+  p.prevUp = up;
+  p.upT = up ? p.upT + dt : 0;
+
+  if (p.state === 'ready') {
+    p.readyT -= dt;
+    p.vy = Math.min(p.vy + G * dt, MAXFALL);
+    moveY(p.vy * dt, up);
+    if (p.readyT <= 0) p.state = 'run';
+    return;
+  }
+
+  // If a little h pops back under little i, little i pops up on top of it.
+  if (!up && p.state !== 'swing') for (const e of level.steps) {
+    const s = stepBox(e);
+    if (overlapsP(s.x0, s.y0, s.x1, s.y1) && p.y - s.y0 < 0.9) { p.y = s.y0; p.vy = Math.min(p.vy, 0); }
+  }
+
+  if (p.state === 'swing') {
+    const h = p.hook, hx = h.c + 0.75, hy = h.r + 0.15;
+    if (up) {
+      // Shift turns the hook f into a flag F, so little i lets go.
+      const v = p.dir * Math.max(0.6, Math.sqrt(Math.max(0, 2 * (G / p.L) * (Math.cos(p.th) - Math.cos(SWING_AMP))))) * p.L * RELEASE_BOOST;
+      p.vx = v * Math.cos(p.th); p.vy = -v * Math.sin(p.th);
+      p.state = 'run'; p.boost = true; h.cool = 0.6; p.hook = null;
+      sfx.letgo();
+      setForm(true, up);
+      return;
+    }
+    p.L = approach(p.L, p.Lt, dt * 4);
+    const wmag = Math.sqrt(Math.max(0, 2 * (G / p.L) * (Math.cos(p.th) - Math.cos(SWING_AMP))));
+    p.th += p.dir * Math.max(wmag, 0.6) * dt;
+    if (p.th > SWING_AMP) { p.th = SWING_AMP; p.dir = -1; }
+    if (p.th < -SWING_AMP) { p.th = -SWING_AMP; p.dir = 1; }
+    p.x = hx + p.L * Math.sin(p.th);
+    p.y = hy + p.L * Math.cos(p.th) + p.h / 2;
+    return;
+  }
+
+  if (p.state === 'climb') {
+    if (!up) p.state = 'run';
+    else {
+      p.vy = 0; p.vx = 0;
+      p.y -= CLIMB * dt;
+      const top = p.ladder.b - 3;
+      if (p.y <= top) { p.y = top; p.state = 'run'; p.grounded = true; sfx.hop(); }
+      return;
+    }
+  }
+
+  if (p.state === 'bonk') {
+    p.bonkT -= dt;
+    if (p.bonkT <= 0) p.state = 'run';
+  } else {
+    if (p.grounded) { p.boost = false; p.airJump = true; p.vx = approach(p.vx, RUN, dt * 30); }
+    else if (p.vx < RUN) p.vx = Math.min(RUN, p.vx + 8 * dt);
+    if (pressed) {
+      if (p.grounded) { p.vy = TAP_HOP; p.grounded = false; sfx.hop(); }
+      else if (p.airJump && game.time - p.lastPress < DOUBLE_T) {
+        p.vy = BIG_BOING; p.airJump = false; sfx.bigBoing();
+        burst(p.x, p.y, 6, COL.i[0]);
+      }
+      p.lastPress = game.time;
+    }
+  }
+  p.vy = Math.min(p.vy + G * dt, MAXFALL);
+  const wasGrounded = p.grounded;
+  const blk = moveX(p.vx * dt, up);
+  moveY(p.vy * dt, up);
+  rememberSafeSpot();
+  if (blk && p.state === 'run' && wasGrounded && p.vx > 0) {
+    if (blk.kind === 'h') { p.vy = HOP; p.grounded = false; sfx.hop(); }
+    else bonk();
+  }
+
+  // Letter interactions
+  for (const e of level.steps) {
+    if (up && p.state === 'run' && overlapsP(e.c + 0.3, e.b - 3 + 0.02, e.c + 0.9, e.b + 0.1) && p.y > e.b - 3 + 0.02) {
+      p.state = 'climb'; p.ladder = e; p.vx = 0; p.vy = 0; break;
+    }
+  }
+  for (const e of level.springs) {
+    if (!up) {
+      if (p.vy >= 0 && overlapsP(e.c + 0.1, e.b - 0.5, e.c + 0.9, e.b)) {
+        p.vy = SPRING; p.grounded = false; e.sq = 1; sfx.spring();
+        burst(e.c + 0.5, e.b - 0.4, 4, COL.s[0]);
+      }
+    } else if (!p.boost && (p.grounded || p.upT >= SLIDE_HOLD) && overlapsP(e.c, e.b - 2, e.c + 1.3, e.b)) {
+      p.vx = SLIDE_VX; p.vy = SLIDE_VY; p.boost = true; p.grounded = false; e.sq = 1; sfx.whoosh();
+      burst(e.c + 0.6, e.b - 1, 6, COL.s[0]);
+    }
+  }
+  if (up) for (const e of level.flags) {
+    if (!e.on && p.x >= e.c + 0.3 && p.x <= e.c + 4) {
+      e.on = true; e.wave = 1; game.flags++; sfx.ding();
+      burst(e.c + 0.8, e.b - 2.4, 8, COL.f[0]);
+    }
+  }
+  if (!up) for (const h of level.hooks) {
+    if (h.cool > 0) continue;
+    const hx = h.c + 0.75, hy = h.r + 0.15, cx = p.x, cy = p.y - p.h / 2;
+    const d = Math.hypot(cx - hx, cy - hy);
+    if (d < GRAB && cy > hy && cx < hx + 0.3) {
+      // Start at the grab distance and reel in, so the swing never dips into the ground.
+      p.state = 'swing'; p.hook = h; p.L = d; p.Lt = clamp(d, ROPE_MIN, ROPE_MAX);
+      p.th = clamp(Math.atan2(cx - hx, cy - hy), -SWING_AMP, SWING_AMP);
+      const w = (p.vx * Math.cos(p.th) - p.vy * Math.sin(p.th)) / p.L;
+      p.dir = w >= 0 ? 1 : -1;
+      p.boost = false; p.grounded = false;
+      sfx.grab();
+      break;
+    }
+  }
+  if (p.x >= level.goalX) win();
+  if (p.y - p.h > ROWS + 0.5) die();
+}
+
+// ---------------------------------------------------------------------------
+// Particles: tiny letters
+// ---------------------------------------------------------------------------
+let seed = 7;
+const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+function burst(x, y, n, color) {
+  if (game.sim) return;
+  for (let i = 0; i < n; i++) {
+    particles.push({ x, y, vx: (rnd() - 0.5) * 6, vy: -rnd() * 6 - 1, life: 0.8 + rnd() * 0.4, t: 0, ch: 'shift'[(rnd() * 5) | 0], color, rot: rnd() * 6 });
+  }
+}
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const q = particles[i];
+    q.t += dt; q.vy += 14 * dt; q.x += q.vx * dt; q.y += q.vy * dt; q.rot += dt * 3;
+    if (q.t > q.life) particles.splice(i, 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Game flow
+// ---------------------------------------------------------------------------
+function startLevel(i) {
+  game.idx = i; game.state = 'play'; game.boings = 0; game.time = 0; game.banner = 2.6; game.bothT = 0; game.flags = 0; game.trail = [];
+  level = LEVELS[i]();
+  resetPlayer({ x: level.start.x, y: level.start.y }, 1.0);
+  cam.x = 0; particles.length = 0;
+  if (input.down) input.latch = true;
+}
+function titleMenu() {
+  game.state = 'title';
+  game.menu = { idx: 0, items: [
+    { label: () => 'play', act: () => { const n = LEVELS.findIndex((_, i) => !save.done[i]); startLevel(n === -1 ? 0 : n); } },
+    { label: () => 'levels', act: levelsMenu },
+    { label: () => 'sound: ' + (snd.on ? 'on' : 'off'), act: () => { snd.on = !snd.on; save.sound = snd.on; persist(); } },
+  ] };
+}
+function levelsMenu() {
+  game.state = 'levels';
+  game.menu = { idx: 0, items: LEVELS.map((_, i) => ({ label: () => `${i + 1}. ${LEVELS_META[i].name}${save.done[i] ? '  \u2713' : ''}`, act: () => startLevel(i) }))
+    .concat([{ label: () => 'back', act: titleMenu }]) };
+}
+function cardMenu() {
+  game.state = 'card'; game.cardT = 0;
+  const last = game.idx === LEVELS.length - 1;
+  game.menu = { idx: 0, items: [
+    { label: () => (last ? 'the end' : 'next level'), act: () => (last ? endScreen() : startLevel(game.idx + 1)) },
+    { label: () => 'play again', act: () => startLevel(game.idx) },
+    { label: () => 'title', act: titleMenu },
+  ] };
+  if (input.down) input.latch = true;
+}
+function endScreen() {
+  game.state = 'end';
+  game.menu = { idx: 0, items: [{ label: () => 'back to title', act: titleMenu }] };
+}
+const LEVELS_META = LEVELS.map((f) => { const L = f(); return { name: L.name, tag: L.tag }; });
+const isMenu = () => game.state === 'title' || game.state === 'levels' || game.state === 'card' || game.state === 'end';
+
+function onPress() {
+  sfx.clack(true);
+  if (game.state === 'play' && p && p.state !== 'dead') burst(p.x, p.y - p.h, 2, COL.i[0]);
+}
+function onRelease(held) {
+  sfx.clack(false);
+  if (input.latch) { input.latch = false; return; }
+  if (isMenu() && held < HOLD && game.menu) { game.menu.idx = (game.menu.idx + 1) % game.menu.items.length; sfx.tick(); }
+}
+function shiftChange() {
+  const d = input.L || input.R || input.P;
+  if (d && !input.down) { input.down = true; input.pressAt = now(); onPress(); }
+  else if (!d && input.down) { input.down = false; onRelease(now() - input.pressAt); }
+}
+addEventListener('keydown', (e) => {
+  if (e.key !== 'Shift') return;
+  e.preventDefault();
+  audioInit();
+  if (e.code === 'ShiftRight') input.R = true; else input.L = true;
+  shiftChange();
+});
+addEventListener('keyup', (e) => {
+  if (e.key !== 'Shift') return;
+  e.preventDefault();
+  if (e.code === 'ShiftRight') input.R = false; else input.L = false;
+  if (!e.shiftKey) { input.L = false; input.R = false; }
+  shiftChange();
+});
+addEventListener('blur', () => { input.L = input.R = input.P = false; shiftChange(); });
+// Touch or click acts as a Shift key so the game also works on phones.
+cv.addEventListener('pointerdown', (e) => { e.preventDefault(); audioInit(); input.P = true; shiftChange(); });
+addEventListener('pointerup', () => { input.P = false; shiftChange(); });
+addEventListener('pointercancel', () => { input.P = false; shiftChange(); });
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+function updatePlay(dt) {
+  const up = shiftHeld();
+  if (p.state !== 'win') game.time += dt;
+  for (const e of level.els) {
+    e.k = approach(e.k, up ? 1 : 0, dt * 9);
+    if (e.cool > 0) e.cool -= dt;
+    if (e.sq > 0) e.sq = Math.max(0, e.sq - dt * 4);
+    if (e.wave > 0) e.wave = Math.max(0, e.wave - dt);
+  }
+  updatePlayer(dt, up);
+}
+function update(dt) {
+  game.clock += dt;
+  const up = game.state === 'play' ? shiftHeld() : input.down;
+  game.worldK = approach(game.worldK, up ? 1 : 0, dt * 9);
+  if (isMenu() && input.down && !input.latch && now() - input.pressAt >= HOLD) {
+    input.latch = true;
+    const it = game.menu.items[game.menu.idx];
+    sfx.ding();
+    it.act();
+  }
+  if (game.state === 'play') {
+    // Hold both Shift keys to go back to the title.
+    if (input.L && input.R) { game.bothT += dt; if (game.bothT > 1.2) { input.latch = true; titleMenu(); return; } } else game.bothT = 0;
+    game.banner = Math.max(0, game.banner - dt);
+    const STEP = 1 / 120;
+    let left = Math.min(dt, 0.1);
+    while (left > 1e-6) { const s = Math.min(STEP, left); updatePlay(s); left -= s; }
+    if (p.state === 'win' && p.winT > 1.4) cardMenu();
+    const target = clamp(p.x - 8, 0, Math.max(0, level.w - W / U));
+    cam.x += (target - cam.x) * Math.min(1, dt * 6);
+  }
+  if (game.state === 'card') game.cardT += dt;
+  updateParticles(dt);
+  musicTick(up);
+}
+
+// ---------------------------------------------------------------------------
+// Drawing helpers (letters are drawn with round strokes, in cell units)
+// ---------------------------------------------------------------------------
+function ink(pair, lw, path) {
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.lineWidth = lw;
+  ctx.strokeStyle = pair[1];
+  ctx.save(); ctx.translate(0, 0.07); ctx.beginPath(); path(); ctx.stroke(); ctx.restore();
+  ctx.strokeStyle = pair[0];
+  ctx.beginPath(); path(); ctx.stroke();
+}
+function rrect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+}
+function eyes(x, y, s = 1, look = 0.03) {
+  ctx.fillStyle = '#4a3b5a';
+  ctx.beginPath(); ctx.arc(x - 0.07 * s + look, y, 0.035 * s, 0, 7); ctx.arc(x + 0.07 * s + look, y, 0.035 * s, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,140,170,.55)';
+  ctx.beginPath(); ctx.arc(x - 0.12 * s + look, y + 0.06 * s, 0.03 * s, 0, 7); ctx.arc(x + 0.12 * s + look, y + 0.06 * s, 0.03 * s, 0, 7); ctx.fill();
+}
+// Draw a pair of shapes that cross-fade with a springy pop as the world shifts.
+function morph(k, lower, upper, ox, oy) {
+  const kl = 1 - k;
+  if (kl > 0.01) { ctx.save(); ctx.globalAlpha *= kl; ctx.translate(ox, oy); const s = 0.6 + 0.4 * easeBack(kl); ctx.scale(s, s); ctx.translate(-ox, -oy); lower(); ctx.restore(); }
+  if (k > 0.01) { ctx.save(); ctx.globalAlpha *= k; ctx.translate(ox, oy); const s = 0.6 + 0.4 * easeBack(k); ctx.scale(s, s); ctx.translate(-ox, -oy); upper(); ctx.restore(); }
+}
+function sPath(w, h) {
+  ctx.moveTo(w * 0.85, -h * 0.82);
+  ctx.bezierCurveTo(w * 0.7, -h * 1.02, w * 0.1, -h * 1.0, w * 0.12, -h * 0.74);
+  ctx.bezierCurveTo(w * 0.14, -h * 0.5, w * 0.9, -h * 0.55, w * 0.9, -h * 0.26);
+  ctx.bezierCurveTo(w * 0.9, h * 0.02, w * 0.25, h * 0.02, w * 0.1, -h * 0.16);
+}
+
+function drawStep(e) {
+  morph(e.k, () => {
+    ink(COL.h, 0.22, () => { ctx.moveTo(0.28, 0); ctx.lineTo(0.28, -1.05); ctx.moveTo(0.28, -0.4); ctx.quadraticCurveTo(0.28, -0.72, 0.53, -0.72); ctx.quadraticCurveTo(0.78, -0.72, 0.78, -0.4); ctx.lineTo(0.78, 0); });
+  }, () => {
+    ctx.lineCap = 'round'; ctx.strokeStyle = 'rgba(210,122,91,.45)'; ctx.lineWidth = 0.08; ctx.beginPath();
+    for (const y of [-0.5, -1, -2, -2.5]) { ctx.moveTo(0.15, y); ctx.lineTo(0.85, y); }
+    ctx.stroke();
+    ink(COL.h, 0.22, () => { ctx.moveTo(0.15, 0); ctx.lineTo(0.15, -3); ctx.moveTo(0.85, 0); ctx.lineTo(0.85, -3); ctx.moveTo(0.15, -1.5); ctx.lineTo(0.85, -1.5); });
+  }, 0.5, 0);
+}
+function drawTree(e) {
+  morph(e.k, () => {
+    ink(COL.t, 0.18, () => { ctx.moveTo(0.48, -0.9); ctx.lineTo(0.48, -0.2); ctx.quadraticCurveTo(0.48, 0, 0.72, -0.04); ctx.moveTo(0.28, -0.6); ctx.lineTo(0.7, -0.6); });
+    ctx.fillStyle = COL.leaf[0]; ctx.beginPath(); ctx.ellipse(0.62, -0.95, 0.14, 0.07, -0.6, 0, 7); ctx.fill();
+  }, () => {
+    ink(COL.t, 0.32, () => { ctx.moveTo(0.5, 0.2); ctx.lineTo(0.5, -2.9); ctx.moveTo(-0.85, -2.86); ctx.lineTo(1.85, -2.86); });
+    ctx.fillStyle = COL.leaf[0];
+    for (let i = 0; i < 5; i++) { ctx.beginPath(); ctx.ellipse(-0.6 + i * 0.6, -2.62, 0.17, 0.09, 0.4, 0, 7); ctx.fill(); }
+  }, 0.5, 0);
+}
+function drawSpring(e) {
+  const sq = Math.sin(e.sq * Math.PI) * 0.4;
+  morph(e.k, () => {
+    ctx.save(); ctx.translate(0.5, 0); ctx.scale(1 + sq * 0.5, 1 - sq); ctx.translate(-0.5, 0);
+    ctx.translate(0.2, 0);
+    ink(COL.s, 0.2, () => sPath(0.6, 0.62));
+    eyes(0.48, -0.5, 0.8);
+    ctx.restore();
+  }, () => {
+    ctx.save(); ctx.translate(0.6, 0); ctx.scale(1 + sq * 0.3, 1 - sq * 0.4); ctx.translate(-0.6, 0);
+    ink(COL.s, 0.32, () => sPath(1.3, 2.0));
+    eyes(1.0, -1.62, 1.6);
+    ctx.strokeStyle = '#f07a9a'; ctx.lineWidth = 0.05; ctx.beginPath(); ctx.moveTo(1.18, -1.55); ctx.lineTo(1.36, -1.5); ctx.stroke();
+    ctx.restore();
+  }, 0.5, 0);
+}
+function drawFlag(e) {
+  const t = game.clock;
+  const pair = e.on ? COL.f : ['#f6c3d8', '#dca2bb'];
+  morph(e.k, () => {
+    ink(pair, 0.2, () => { ctx.moveTo(0.42, 0); ctx.lineTo(0.42, -0.95); ctx.quadraticCurveTo(0.42, -1.25, 0.76, -1.18); ctx.moveTo(0.2, -0.62); ctx.lineTo(0.68, -0.62); });
+  }, () => {
+    const w1 = Math.sin(t * 5) * 0.08 * (e.on ? 1 : 0.3), w2 = Math.sin(t * 5 + 1) * 0.08 * (e.on ? 1 : 0.3);
+    ink(pair, 0.24, () => { ctx.moveTo(0.3, 0); ctx.lineTo(0.3, -2.6); ctx.lineTo(1.25, -2.6 + w1); ctx.moveTo(0.3, -1.95); ctx.lineTo(1.0, -1.95 + w2); });
+  }, 0.4, 0);
+  if (e.on && e.wave > 0) wtext('saved!', 0.6, -3 - (1 - e.wave), 0.5, `rgba(205,99,145,${e.wave})`);
+}
+function drawHook(e) {
+  morph(e.k, () => {
+    ink(COL.f, 0.2, () => { ctx.moveTo(0.4, 1.0); ctx.lineTo(0.4, 0.45); ctx.quadraticCurveTo(0.4, 0.08, 0.75, 0.15); ctx.moveTo(0.18, 0.62); ctx.lineTo(0.64, 0.62); });
+  }, () => {
+    const w = Math.sin(game.clock * 5) * 0.06;
+    ink(['#f6c3d8', '#dca2bb'], 0.2, () => { ctx.moveTo(0.35, 1.0); ctx.lineTo(0.35, 0.1); ctx.lineTo(0.95, 0.1 + w); ctx.moveTo(0.35, 0.5); ctx.lineTo(0.8, 0.5 + w); });
+  }, 0.5, 0.5);
+}
+function drawGoal(e) {
+  const up = game.worldK > 0.5, word = up ? 'SHIFT' : 'shift';
+  ink(COL.t, 0.3, () => { ctx.moveTo(0, 0); ctx.lineTo(0, -4); ctx.moveTo(5, 0); ctx.lineTo(5, -4); });
+  ctx.fillStyle = '#fff'; rrect(-0.3, -4.9, 5.6, 1.3, 0.4); ctx.fill();
+  ctx.strokeStyle = COL.f[0]; ctx.lineWidth = 0.1; ctx.stroke();
+  for (let i = 0; i < 5; i++) wtext(word[i], 0.65 + i * 0.93, -3.9 + Math.sin(game.clock * 4 + i) * 0.06, 0.95, LETTER_COLS['shift'[i]][1]);
+}
+
+function drawPlayer() {
+  if (!p || p.state === 'dead') return;
+  const bob = p.grounded && p.state === 'run' ? Math.abs(Math.sin(p.phase)) * 0.08 : 0;
+  const pop = 1 + Math.sin(p.morph * Math.PI) * 0.15;
+  if (p.state === 'swing') {
+    const h = p.hook, hx = h.c + 0.75, hy = h.r + 0.15;
+    ctx.strokeStyle = 'rgba(106,88,124,.5)'; ctx.lineWidth = 0.05; ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(p.x, p.y - p.h + 0.15); ctx.stroke();
+  }
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  if (p.state === 'swing') ctx.rotate(-p.th * 0.4);
+  ctx.scale(pop, 1 / pop);
+  if (p.w === BIG.w) {
+    ctx.translate(0, -bob);
+    ctx.fillStyle = COL.i[1]; rrect(-0.25, -2.2 + 0.07, 0.5, 2.2, 0.2); ctx.fill();
+    ctx.fillStyle = COL.i[0]; rrect(-0.25, -2.2, 0.5, 2.2, 0.2); ctx.fill();
+    ctx.fillStyle = COL.i[1]; rrect(-0.65, -2.2 + 0.07, 1.3, 0.26, 0.13); ctx.fill(); rrect(-0.65, -0.26 + 0.07, 1.3, 0.26, 0.13); ctx.fill();
+    ctx.fillStyle = COL.i[0]; rrect(-0.65, -2.2, 1.3, 0.26, 0.13); ctx.fill(); rrect(-0.65, -0.26, 1.3, 0.26, 0.13); ctx.fill();
+    eyes(0, -1.65, 1.3, 0.04);
+  } else {
+    const sq = p.squished ? Math.sin(game.clock * 30) * 0.05 : 0;
+    ctx.translate(0, -bob);
+    ctx.fillStyle = COL.i[1]; rrect(-0.15, -0.6 + 0.06, 0.3, 0.6, 0.15); ctx.fill();
+    ctx.fillStyle = COL.i[0]; rrect(-0.15 - sq, -0.6, 0.3 + sq * 2, 0.6, 0.15); ctx.fill();
+    ctx.fillStyle = COL.i[1]; ctx.beginPath(); ctx.arc(0, -0.83 + 0.05, 0.21, 0, 7); ctx.fill();
+    ctx.fillStyle = COL.i[0]; ctx.beginPath(); ctx.arc(0, -0.83 - bob * 0.5, 0.21, 0, 7); ctx.fill();
+    eyes(0.02, -0.84 - bob * 0.5, 0.95, 0.04);
+  }
+  ctx.restore();
+}
+
+function drawBackground(camX, kUp) {
+  const up = kUp > 0.5;
+  ctx.fillStyle = COL.paper; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = COL.rule; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let y = U * 2; y < H; y += U) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+  ctx.stroke();
+  const mx = (1.4 - camX) * U;
+  if (mx > -10) { ctx.strokeStyle = COL.margin; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(mx, 0); ctx.lineTo(mx, H); ctx.stroke(); }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // Clouds: the word "shift", drifting slowly.
+  ctx.font = font(30, 800);
+  const cspan = W + 360;
+  for (let i = 0; i < 4; i++) {
+    const x = (((i * 310 + 80) - camX * U * 0.12 - game.clock * 6) % cspan + cspan) % cspan - 180;
+    const y = 60 + ((i * 47) % 70);
+    ctx.lineWidth = 10; ctx.lineJoin = 'round'; ctx.strokeStyle = 'rgba(255,255,255,.95)';
+    const word = up ? 'SHIFT' : 'shift';
+    ctx.strokeText(word, x, y);
+    ctx.fillStyle = 'rgba(169,139,224,.1)'; ctx.fillText(word, x, y);
+  }
+  // Floating letters.
+  for (const b of bgLetters) {
+    const x = ((b.x * U - camX * U * 0.3) % (W + 200) + W + 200) % (W + 200) - 100;
+    ctx.save(); ctx.translate(x, b.y * U); ctx.rotate(b.rot);
+    ctx.globalAlpha = 0.06; ctx.fillStyle = LETTER_COLS[b.ch][0];
+    ctx.font = font(b.size * U * 0.5); ctx.fillText(up ? b.ch.toUpperCase() : b.ch, 0, 0);
+    ctx.restore();
+  }
+  // Hills: giant s h i f t letters along the horizon.
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = font(U * 6.5, 800);
+  const step = U * 4.6, span = step * 5 + U * 3;
+  const off = -((camX * U * 0.25) % span);
+  for (let k = -1; k < Math.ceil(W / span) + 1; k++) {
+    for (let i = 0; i < 5; i++) {
+      const ch = 'shift'[i], x = off + k * span + i * step + U * 2;
+      ctx.fillStyle = LETTER_COLS[ch][0]; ctx.globalAlpha = 0.09;
+      ctx.fillText(up ? ch.toUpperCase() : ch, x, 12 * U + U * 1.2);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+// The ground is a keyboard: every block is a keycap stamped with S, H, I, F, or T.
+// Each row spells "shift", the keys press down when you hold Shift, and the letters flip case.
+function drawGround(camX, kUp) {
+  const c0 = Math.floor(camX) - 1, c1 = Math.ceil(camX + W / U) + 1;
+  const up = kUp > 0.5, flip = Math.max(0.08, Math.abs(2 * kUp - 1)), press = kUp * 3;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = font(U * 0.66, 800);
+  for (let c = c0; c <= c1; c++) {
+    for (let r = 0; r < ROWS; r++) {
+      if (!isSolid(c, r)) continue;
+      const x = (c - camX) * U, y = r * U, top = !isSolid(c, r - 1);
+      ctx.fillStyle = COL.keyTray; ctx.fillRect(x - 0.5, y - 0.5, U + 1, U + 1);
+      ctx.fillStyle = COL.keySide; rrect(x + 2, y + 2, U - 4, U - 4, 8); ctx.fill();
+      ctx.fillStyle = top ? '#fffdf8' : COL.keyFace; rrect(x + 3.5, y + 2.5 + press, U - 7, U - 10, 7); ctx.fill();
+      const ch = 'shift'[((c + r * 2) % 5 + 5) % 5];
+      ctx.save();
+      ctx.translate(x + U / 2, y + U / 2 - 2 + press);
+      ctx.scale(1, flip);
+      ctx.globalAlpha = top ? 0.5 : 0.28;
+      ctx.fillStyle = top ? LETTER_COLS[ch][1] : COL.keySide;
+      ctx.fillText(up ? ch.toUpperCase() : ch, 0, 1);
+      ctx.restore();
+    }
+  }
+  ctx.textBaseline = 'alphabetic';
+}
+// Text drawn inside the cell-scaled world, at a real pixel font size.
+function wtext(str, x, y, sizeCells, color) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(1 / U, 1 / U);
+  ctx.font = font(sizeCells * U); ctx.fillStyle = color; ctx.textAlign = 'center';
+  ctx.fillText(str, 0, 0);
+  ctx.restore();
+}
+function drawSigns(camX, kUp) {
+  ctx.textAlign = 'left';
+  ctx.font = font(17, 600);
+  for (const s of level.signs) {
+    const x = (s.x - camX) * U;
+    if (x < -400 || x > W + 50) continue;
+    const lines = (kUp > 0.5 ? s.text.toUpperCase() : s.text).split('\n');
+    ctx.fillStyle = 'rgba(106,88,124,.7)';
+    lines.forEach((ln, i) => ctx.fillText(ln, x, s.y * U + i * 22 - (lines.length - 1) * 22));
+  }
+}
+function drawWorld() {
+  const kUp = game.worldK, camX = cam.x;
+  drawBackground(camX, kUp);
+  drawSigns(camX, kUp);
+  drawGround(camX, kUp);
+  ctx.save();
+  ctx.scale(U, U); ctx.translate(-camX, 0);
+  for (const e of level.els) {
+    if (e.c < camX - 4 || e.c > camX + W / U + 4) continue;
+    ctx.save();
+    if (e.t === 'hook') ctx.translate(e.c, e.r); else ctx.translate(e.c, e.b);
+    if (e.t === 'h') drawStep(e);
+    else if (e.t === 't') drawTree(e);
+    else if (e.t === 's') drawSpring(e);
+    else if (e.t === 'f') drawFlag(e);
+    else if (e.t === 'hook') drawHook(e);
+    else if (e.t === 'goal') drawGoal(e);
+    ctx.restore();
+  }
+  drawPlayer();
+  for (const q of particles) {
+    ctx.save(); ctx.globalAlpha = Math.max(0, 1 - q.t / q.life);
+    ctx.translate(q.x, q.y); ctx.rotate(q.rot);
+    wtext(kUp > 0.5 ? q.ch.toUpperCase() : q.ch, 0, 0, 0.4, q.color);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawKeycap(x, y, w, pressed, label) {
+  const d = pressed ? 4 : 0;
+  ctx.fillStyle = '#d9cbe8'; rrect(x, y + 6, w, 44, 12); ctx.fill();
+  ctx.fillStyle = pressed ? '#efe6fb' : '#fff'; rrect(x, y + d, w, 44, 12); ctx.fill();
+  ctx.strokeStyle = '#cbb8e3'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = COL.ink; ctx.font = font(20); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + w / 2, y + 23 + d);
+  ctx.textBaseline = 'alphabetic';
+}
+function drawHUD() {
+  const up = shiftHeld();
+  ctx.textAlign = 'left'; ctx.fillStyle = COL.ink; ctx.font = font(18);
+  ctx.fillText(`${game.idx + 1}. ${level.name}`, 20, 32);
+  ctx.textAlign = 'right';
+  ctx.fillText(`flags: ${game.flags}/${level.flags.length}`, W - 20, 32);
+  drawKeycap(W / 2 - 70, H - 62, 140, input.down, up ? '\u21E7 SHIFT' : '\u21E7 shift');
+  if (game.banner > 0) {
+    const a = Math.min(1, game.banner, (2.6 - game.banner) * 4);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(255,255,255,.9)'; rrect(W / 2 - 230, 70, 460, 92, 22); ctx.fill();
+    ctx.textAlign = 'center'; ctx.fillStyle = COL.ink; ctx.font = font(34);
+    ctx.fillText(level.name, W / 2, 112);
+    ctx.font = font(17, 600); ctx.fillStyle = 'rgba(106,88,124,.75)';
+    ctx.fillText(level.tag, W / 2, 142);
+    ctx.globalAlpha = 1;
+  }
+  if (game.bothT > 0.1) {
+    ctx.textAlign = 'center'; ctx.fillStyle = COL.ink; ctx.font = font(16);
+    ctx.fillText('keep holding both shifts for the title...', W / 2, 70);
+  }
+}
+function drawMenu(x, y, gap) {
+  const m = game.menu;
+  const held = input.down && !input.latch ? clamp((now() - input.pressAt) / HOLD, 0, 1) : 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  m.items.forEach((it, i) => {
+    const yy = y + i * gap, sel = i === m.idx;
+    ctx.font = font(sel ? 26 : 22);
+    const label = it.label();
+    const tw = ctx.measureText(label).width + 50;
+    if (sel) {
+      ctx.fillStyle = '#fff'; rrect(x - tw / 2, yy - 22, tw, 44, 22); ctx.fill();
+      ctx.strokeStyle = COL.i[0]; ctx.lineWidth = 3; ctx.stroke();
+      if (held > 0) {
+        ctx.save(); rrect(x - tw / 2, yy - 22, tw, 44, 22); ctx.clip();
+        ctx.fillStyle = 'rgba(169,139,224,.35)'; ctx.fillRect(x - tw / 2, yy - 22, tw * held, 44);
+        ctx.restore();
+      }
+    }
+    ctx.fillStyle = sel ? COL.ink : 'rgba(106,88,124,.6)';
+    ctx.fillText(label, x, yy + 1);
+  });
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = font(16, 600); ctx.fillStyle = 'rgba(106,88,124,.7)';
+  ctx.fillText('tap shift to choose  \u00B7  hold shift to pick', x, H - 26);
+}
+function drawLittleI(x, y, s, t) {
+  const bob = Math.abs(Math.sin(t * 4)) * 0.25;
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  ctx.fillStyle = COL.i[1]; rrect(-0.15, -0.6 + 0.06, 0.3, 0.6, 0.15); ctx.fill();
+  ctx.fillStyle = COL.i[0]; rrect(-0.15, -0.6, 0.3, 0.6, 0.15); ctx.fill();
+  ctx.fillStyle = COL.i[0]; ctx.beginPath(); ctx.arc(0, -0.85 - bob, 0.21, 0, 7); ctx.fill();
+  eyes(0.02, -0.86 - bob, 0.95, 0.04);
+  ctx.restore();
+}
+function drawTitle() {
+  cam.x += 1 / 60 * 1.5;
+  drawBackground(cam.x, game.worldK);
+  const up = game.worldK > 0.5;
+  ctx.textAlign = 'center'; ctx.fillStyle = COL.ink;
+  ctx.font = font(88);
+  ctx.fillText(up ? 'LITTLE' : 'little', W / 2 - 40, 170);
+  if (up) { ctx.fillStyle = COL.i[0]; ctx.fillText('I', W / 2 + 150, 170); }
+  else drawLittleI(W / 2 + 150, 170, 80, game.clock);
+  ctx.font = font(19, 600); ctx.fillStyle = 'rgba(106,88,124,.75)';
+  const sub = 'a one-key game. the world is made of s h i f t.';
+  ctx.fillText(up ? sub.toUpperCase() : sub, W / 2, 220);
+  if (game.state === 'title') drawMenu(W / 2, 300, 58);
+  else drawMenu(W / 2, 270, 46);
+  drawKeycap(40, H - 74, 140, input.down, input.down ? '\u21E7 SHIFT' : '\u21E7 shift');
+}
+function drawCard() {
+  drawWorld();
+  ctx.fillStyle = 'rgba(255,250,241,.75)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff'; rrect(W / 2 - 260, 80, 520, 380, 30); ctx.fill();
+  ctx.strokeStyle = COL.f[0]; ctx.lineWidth = 4; ctx.stroke();
+  ctx.textAlign = 'center'; ctx.fillStyle = COL.ink; ctx.font = font(40);
+  ctx.fillText(game.worldK > 0.5 ? 'YAY!' : 'yay!', W / 2, 140);
+  ctx.font = font(20, 600);
+  ctx.fillText(`${level.name}: done`, W / 2, 178);
+  ctx.fillText(`flags planted: ${game.flags}/${level.flags.length}   \u00B7   boings: ${game.boings}`, W / 2, 210);
+  drawMenu(W / 2, 270, 54);
+}
+function drawEnd() {
+  cam.x += 1 / 40;
+  drawBackground(cam.x, game.worldK);
+  ctx.textAlign = 'center'; ctx.fillStyle = COL.ink; ctx.font = font(64);
+  ctx.fillText(game.worldK > 0.5 ? 'THE END' : 'the end', W / 2, 170);
+  ctx.font = font(22, 600);
+  ctx.fillText('little i SHIFTed the whole world.', W / 2, 220);
+  ctx.fillText('thank you for playing! \u2665', W / 2, 254);
+  drawLittleI(W / 2, 360, 70, game.clock);
+  drawMenu(W / 2, 420, 50);
+}
+
+function draw() {
+  ctx.setTransform(pxScale, 0, 0, pxScale, 0, 0);
+  if (game.state === 'play') { drawWorld(); drawHUD(); }
+  else if (game.state === 'card') drawCard();
+  else if (game.state === 'end') drawEnd();
+  else drawTitle();
+}
+
+let last = now();
+function frame() {
+  const t = now();
+  const dt = Math.min(0.05, t - last);
+  last = t;
+  if (!game.sim) update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+titleMenu();
+requestAnimationFrame(frame);
+
+// ---------------------------------------------------------------------------
+// Test hook: run a level headlessly with a scripted Shift policy.
+// Used to check that every level can be finished.
+// ---------------------------------------------------------------------------
+window.LITTLE_I = {
+  game, LEVELS, get level() { return level; }, get player() { return p; },
+  play(i, policy, maxT = 240) {
+    game.sim = { shift: false };
+    snd.muted = true;
+    startLevel(i);
+    game.banner = 0;
+    const STEP = 1 / 120;
+    let t = 0, tapUntil = -1;
+    const log = [];
+    let lastBoings = 0;
+    while (t < maxT && p.state !== 'win') {
+      let s = policy ? policy(p, level, t) : null;
+      if (s === 'tap' && t >= tapUntil + 0.2) { tapUntil = t + 0.1; }
+      game.sim.shift = t < tapUntil ? true : s === 'tap' ? false : !!s;
+      updatePlay(STEP);
+      if (game.boings !== lastBoings) { lastBoings = game.boings; log.push(+p.cp.x.toFixed(1)); }
+      t += STEP;
+    }
+    const res = { won: p.state === 'win', boings: game.boings, t: +t.toFixed(2), x: +p.x.toFixed(2), w: level.w, deathsNearCp: log.slice(0, 8) };
+    game.sim = null;
+    snd.muted = false;
+    titleMenu();
+    return res;
+  },
+  // A simple autopilot built from the level's "hold Shift here" zones.
+  bot(p, L) {
+    if (p.state === 'climb') return true;
+    if (p.state === 'swing') return p.dir > 0 && p.th > 0.3 && p.th < 0.75 ? 'tap' : false;
+    return L.zones.some(([a, b]) => p.x >= a && p.x <= b);
+  },
+};
+})();
+</script>
+</body>
+</html>
